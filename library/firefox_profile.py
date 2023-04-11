@@ -7,19 +7,6 @@ import subprocess
 import configparser
 import shutil
 
-class FirefoxConfigWrapper:
-    """Wrapper around file object to remove spaces around .ini file delimiters.
-
-    Taken from http://stackoverflow.com/a/25084055.
-    """
-
-    output_file = None
-    def __init__(self, new_output_file):
-        self.output_file = new_output_file
-
-    def write(self, what):
-        self.output_file.write(what.replace(" = ", "="))
-
 
 class FirefoxProfiles:
     """Class to manage firefox profiles."""
@@ -34,37 +21,31 @@ class FirefoxProfiles:
 
     def read(self):
         self.config.read(self.profiles_ini)
-        self.sections = OrderedDict()
-        for section in self.config.sections():
-            if section.startswith('Profile'):
-                profile = dict(self.config.items(section))
-                self.sections[profile['Name']] = section
 
     def write(self):
-        # Reorder the current sections, otherwise firefox deletes them on start.
-        new = configparser.ConfigParser()
-        new.optionxform = str
-        new.add_section('General')
-        for item in self.config.items('General'):
-            new.set('General', item[0], item[1])
-
-        index = 0
-        for section in self.sections.values():
-            new_section = 'Profile%d' % index
-            new.add_section(new_section)
-            for item in self.config.items(section):
-                new.set(new_section, item[0], item[1])
-            index += 1
-
-        with open(self.profiles_ini, 'wb') as config_file:
-            new.write(FirefoxConfigWrapper(config_file))
+        with open(self.profiles_ini, 'w') as f:
+            self.config.write(f, spaces_around_delimiters=False)
 
         # Update state with the new file.
         self.read()
 
-    def get(self, name):
-        if name in self.sections:
-            return dict(self.config.items(self.sections[name]))
+    def get(self, name, get_section_name=False):
+        for section in self.config.sections():
+            if section.startswith('Profile'):
+                if self.config[section]['Name'] == name:
+                    if get_section_name:
+                        return dict(self.config[section]), section
+                    else:
+                        return dict(self.config[section])
+
+    def get_default(self, **kwargs):
+        for section in self.config.sections():
+            if section.startswith('Install'):
+                default_path = self.config[section]['Default']
+                for s2 in self.config.sections():
+                    if s2.startswith('Profile'):
+                        if self.config[s2]['Path'] == default_path:
+                            return self.config[s2]['Name']
 
     def get_path(self, name):
         profile = self.get(name)
@@ -74,13 +55,26 @@ class FirefoxProfiles:
             return profile['Path']
 
     def delete(self, name):
-        profile = self.get(name)
+        profile = self.get(name, get_section_name=True)
         if profile is not None:
+            profile, section = profile
             shutil.rmtree(self.get_path(name))
-            self.sections.pop(name)
+            del self.config[section]
             self.write()
 
-    def create(self, name):
+    def first_startup(self):
+        command = 'firefox --headless --no-remote --first-startup'
+        p = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            (stdout, stderr) = p.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            p.kill()
+        else:
+            if p.returncode != 0:
+                raise Exception(stderr)
+        self.read()
+
+    def create(self, name, default=True):
         command = 'firefox --headless -no-remote -CreateProfile %s' % name
         p = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         (stdout, stderr) = p.communicate()
@@ -89,10 +83,9 @@ class FirefoxProfiles:
         self.read()
 
 
-
 def main():
     fields = {
-        'name': {'required': True, 'type': 'str'},
+        'name': {'required': False, 'type': 'str'},
         'path': {'default': '~/.mozilla/firefox', 'type': 'str'},
         'state': {
             'default': 'present',
@@ -102,14 +95,22 @@ def main():
     }
     module = AnsibleModule(argument_spec=fields)
     profiles = FirefoxProfiles(module.params['path'])
-    name = module.params['name']
-    path = profiles.get_path(name)
+    name = module.params.get('name', None)
     changed = False
-    if module.params['state'] == 'present' and profiles.get(name) is None:
+
+    if module.params['state'] == 'present' and name is None:
+        default = profiles.get_default()
+        if default is None:
+            profiles.first_startup()
+            changed = True
+        name = profiles.get_default()
+        path = profiles.get_path(name)
+    elif module.params['state'] == 'present' and profiles.get(name) is None:
         profiles.create(name)
         changed = True
         path = profiles.get_path(name)
     elif module.params['state'] == 'absent' and profiles.get(name) is not None:
+        path = profiles.get_path(name)
         profiles.delete(name)
         changed = True
     module.exit_json(changed=changed, profile_name=name, profile_path=path)
